@@ -219,6 +219,6 @@ fargoldcity=>
 
 <details>
 <summary>Пруфы скринами</summary>
-![](images/recovery_script.sh)
+![](images/recovery_script.png)
 </details>
 
