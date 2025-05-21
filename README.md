@@ -92,6 +92,10 @@ scp ~/"$BACKUP_NAME".gz postgres2@pg158.cs.ifmo.ru:~/backups
 rm ~/"$BACKUP_NAME".gz
 ```
 
+```shell
+pg_dumpall --globals-only | grep -v -i "TABLESPACE" > ~/backups/globals_roles_only.sql
+```
+
 Запустим скрипт, чтобы проверить его работоспособность
 
 **Основной узел**
@@ -151,11 +155,13 @@ crontab -e
 ### Этап 2. Потеря основного узла
 
 ```shell
-[postgres2@pg158 ~]$ mkdir tah70
-[postgres2@pg158 ~]$ chmod 700 tah70
-[postgres2@pg158 ~]$ initdb --encoding=ISO_8859_5 --username=postgres0 --pwprompt
-[postgres2@pg158 ~]$ mkdir vwp40
-[postgres2@pg158 ~]$ chmod 700 vwp40
+mkdir tah70
+chmod 700 tah70
+export PGDATA=~/tah70
+initdb --encoding=ISO_8859_5 --username=postgres0 --pwprompt
+mkdir vwp40
+chmod 700 vwp40
+pg_ctl -D $PGDATA start
 ```
 
 ```bash
@@ -224,3 +230,181 @@ fargoldcity=>
 <img src="images/rec_1.png" alt="Скриншот" />
 </details>
 
+---
+
+### Этап 3. Повреждение файлов БД
+
+Ломаем файлы
+
+```shell
+rm -rf "$PGDATA/pg_wal"/*
+pg_ctl -D "$PGDATA" restart 
+```
+
+Без перезапуска сервера, зайдя в бд, мы увидим, что все в порядке и наши данные на месте, но при перезапуске сервер не
+поднимется. Это связано с тем, что в каталоге pg_wal содержит журналы предзаписи, необходимые для обеспечения
+целостности данных при старте. Поэтому сервер не сможет восстановить согласованность бд при перезапуске и откажется
+запускаться.
+
+```shell
+[postgres0@pg155 ~]$ rm -rf tah70/pg_wal/
+[postgres0@pg155 ~]$ ls
+backup.log                      globals.sql.gz                  restore_base.sh                 tah70
+fargoldcity_2025-05-22.sql      new_vwp40                       scripts                         vwp40
+[postgres0@pg155 ~]$ psql -U postgres0 -p 9136 fargoldcity
+psql (16.4)
+Type "help" for help.
+
+fargoldcity=# \su
+invalid command \su
+Try \? for help.
+fargoldcity=# \du
+                             List of roles
+ Role name |                         Attributes
+-----------+------------------------------------------------------------
+ cityuser  |
+ postgres0 | Superuser, Create role, Create DB, Replication, Bypass RLS
+
+fargoldcity=# ls
+fargoldcity-# select * from test_table;
+ERROR:  syntax error at or near "ls"
+LINE 1: ls
+        ^
+fargoldcity=#
+select * from test_table;
+ id |  name
+----+---------
+  1 | Alice
+  2 | Bob
+  3 | Charlie
+  4 | David
+  5 | Eve
+  6 | Frank
+  7 | Grace
+(7 rows)
+
+fargoldcity=# \q
+[postgres0@pg155 ~]$ pg_ctl restart
+waiting for server to shut down...... done
+server stopped
+waiting for server to start....2025-05-22 01:14:00.755 MSK [30833] LOG:  ending log output to stderr
+2025-05-22 01:14:00.755 MSK [30833] HINT:  Future log output will go to log destination "syslog".
+ stopped waiting
+pg_ctl: could not start server
+Examine the log output.
+[postgres0@pg155 ~]$ psql -U postgres0 -p 9136 fargoldcity
+psql: error: connection to server on socket "/tmp/.s.PGSQL.9136" failed: No such file or directory
+        Is the server running locally and accepting connections on that socket?
+[postgres0@pg155 ~]$
+```
+
+Поэтому получаем с резерва последний бэкап
+
+```shell
+[postgres2@pg158 ~]$ scp backups/fargoldcity_2025-05-22.sql.gz postgres0@pg155.cs.ifmo.ru:~/
+(postgres0@pg155.cs.ifmo.ru) Password for postgres0@pg155.cs.ifmo.ru:
+fargoldcity_2025-05-22.sql.gz                                                             100%  926     1.3MB/s   00:00
+```
+
+Удаляем прошлый кластер и пересоздаем новый, так как содержимое кластера становится недостоверным, единственный надёжный
+способ восстановить работу СУБД — полностью переинициализировать кластер с помощью initdb, а затем восстановить данные
+из резервной копии.
+
+```shell
+[postgres0@pg155 ~]$ rm -rf tah70
+[postgres0@pg155 ~]$ mkdir tah70
+[postgres0@pg155 ~]$ chmod 700 tah70
+[postgres0@pg155 ~]$ export PGDATA=~/tah70
+[postgres0@pg155 ~]$ initdb --encoding=ISO_8859_5 --username=postgres0 --pwprompt
+### А тут я меняю порты на 9136 с 5432
+[postgres0@pg155 ~]$ pg_ctl -D $PGDATA start
+````
+
+
+И запускаем скрипт восстановления
+
+```bash
+#!/usr/local/bin/bash
+
+PGPORT=9136
+PGUSER=postgres0
+DBNAME=fargoldcity
+DUMP_FILE=~/fargoldcity_2025-05-22.sql
+NEW_TABLESPACE_DIR=~/new_vwp40
+TABLESPACE_NAME=index_space
+
+
+mkdir -p "$NEW_TABLESPACE_DIR"
+chmod 700 "$NEW_TABLESPACE_DIR"
+
+psql -U "$PGUSER" -p "$PGPORT" -d postgres -tc "SELECT 1 FROM pg_roles WHERE rolname='cityuser'" | grep -q 1 || \
+psql -U "$PGUSER" -p "$PGPORT" -d postgres -c "CREATE ROLE cityuser LOGIN PASSWORD '1234';"
+
+psql -U "$PGUSER" -p "$PGPORT" -d postgres -tc "SELECT 1 FROM pg_tablespace WHERE spcname='$TABLESPACE_NAME'" | grep -q 1 || \
+psql -U "$PGUSER" -p "$PGPORT" -d postgres -c "CREATE TABLESPACE $TABLESPACE_NAME LOCATION '$NEW_TABLESPACE_DIR';"
+
+psql -U "$PGUSER" -p "$PGPORT" -lqt | cut -d \| -f 1 | grep -qw "$DBNAME" || \
+psql -U "$PGUSER" -p "$PGPORT" -d postgres -c "CREATE DATABASE $DBNAME OWNER $PGUSER TEMPLATE template1;"
+
+gzip -d "$DUMP_FILE".gz
+
+psql -U "$PGUSER" -p "$PGPORT" -d "$DBNAME" < "$DUMP_FILE"
+psql -U "$PGUSER" -p "$PGPORT" -d "$DBNAME" -c '\dt'
+```
+
+**Результат**
+
+```shell
+[postgres0@pg155 ~]$ ./restore_base.sh
+CREATE ROLE
+CREATE TABLESPACE
+CREATE DATABASE
+SET
+SET
+SET
+SET
+SET
+ set_config
+------------
+
+(1 row)
+
+SET
+SET
+SET
+SET
+ALTER SCHEMA
+SET
+SET
+CREATE TABLE
+ALTER TABLE
+CREATE SEQUENCE
+ALTER SEQUENCE
+ALTER SEQUENCE
+ALTER TABLE
+COPY 7
+ setval
+--------
+      7
+(1 row)
+
+ALTER TABLE
+SET
+CREATE INDEX
+GRANT
+           List of relations
+ Schema |    Name    | Type  |  Owner
+--------+------------+-------+----------
+ public | test_table | table | cityuser
+(1 row)
+```
+<details>
+<summary>Пруфы скринами</summary>
+<img src="images/rec_2.png" alt="Скриншот" />
+</details>
+
+---
+
+### Этап 4. Логическое повреждение данных
+
+```shell
