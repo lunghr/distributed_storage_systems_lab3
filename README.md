@@ -320,7 +320,6 @@ fargoldcity_2025-05-22.sql.gz                                                   
 [postgres0@pg155 ~]$ pg_ctl -D $PGDATA start
 ````
 
-
 И запускаем скрипт восстановления
 
 ```bash
@@ -398,6 +397,7 @@ GRANT
  public | test_table | table | cityuser
 (1 row)
 ```
+
 <details>
 <summary>Пруфы скринами</summary>
 <img src="images/rec_2.png" alt="Скриншот" />
@@ -407,4 +407,202 @@ GRANT
 
 ### Этап 4. Логическое повреждение данных
 
+Чтобы восстановить базу после логической ошибки (например, случайного удаления таблиц), нужно заранее включить
+сохранение архивных WAL-файлов — это специальные журналы, которые фиксируют все изменения в базе. Плюсом ко всему нам
+нужен base backup, так что создаем директорию и для него
+
+Конфигурируем ```postgresql.conf```
+
 ```shell
+wal_level = replica
+archive_mode = on
+archive_command = 'cp %p /var/db/postgres0/backups/wal/%f'
+```
+
+```wal_level = replica ``` включает расширенное логирование изменений, необходимое для возможности восстановления
+
+```archive_mode = on ```включает режим архивирования WAL-файлов
+
+```archive_command ``` указывает директорию, куда будут сохраняться архивы
+
+Потом создаем директорию для архивов и бэкапов, перезапускаем сервер и заходим в бд
+
+```shell
+mkdir -p /var/db/postgres0/backups/wal
+mkdir -p /var/db/postgres0/backups/base
+chmod 700 /var/db/postgres0/backups/wal
+chmod 700 /var/db/postgres0/backups/base
+```
+
+```shell
+pg_ctl -D $PGDATA restart
+psql -U postgres0 -p 9136 fargoldcity
+```
+
+Руками создаем бэкап нашей исходной базы
+
+```shell
+pg_basebackup -D ~/backups/base/2025-05-22 -Ft -z -P -X stream
+```
+
+После чего со спокойной душой можем ломать таблицу
+
+```shell
+[postgres0@pg155 ~]$ clear
+[postgres0@pg155 ~]$ psql -U postgres0 -p 9136 fargoldcity
+psql (16.4)
+Type "help" for help.
+
+fargoldcity=# select * from test_table;
+ id |  name
+----+---------
+  1 | Alice
+  2 | Bob
+  3 | Charlie
+  4 | David
+  5 | Eve
+  6 | Frank
+  7 | Grace
+(7 rows)
+
+fargoldcity=# INSERT INTO test_table (name) VALUES ('one'), ('two'), ('three');
+INSERT 0 3
+fargoldcity=# select * from test_table;
+ id |  name
+----+---------
+  1 | Alice
+  2 | Bob
+  3 | Charlie
+  4 | David
+  5 | Eve
+  6 | Frank
+  7 | Grace
+  8 | one
+  9 | two
+ 10 | three
+(10 rows)
+
+fargoldcity=# SELECT now();
+              now
+-------------------------------
+ 2025-05-23 00:05:54.390419+03
+(1 row)
+
+fargoldcity=# DROP TABLE test_table;
+DROP TABLE
+fargoldcity=# select * from test_table;
+ERROR:  relation "test_table" does not exist
+LINE 1: select * from test_table;
+                      ^
+fargoldcity=#
+```
+
+Теперь нам нужно восстановить базу до состояния до удаления таблицы. Для этого мы будем использовать скрипт ниже
+
+```bash
+#!/usr/local/bin/bash
+
+export PGDATA="/var/db/postgres0/tah70"
+ARCHIVE_DIR="/var/db/postgres0/wal"
+PGUSER="postgres0"
+BACKUP_DIR="/var/db/postgres0/backups/base"
+BACKUP_FILE="2025-05-22"
+WAL="/var/db/postgres0/backups/wal"
+PGPORT=9136
+TABLESPACE_DIR="/var/db/postgres0/new_vwp40"
+TIME='2025-05-23 00:05:54.390419+03'
+
+
+pg_ctl stop
+
+rm -rf "$TABLESPACE_DIR"
+mkdir -p "$TABLESPACE_DIR"
+chown -R "$PGUSER":postgres "$TABLESPACE_DIR"
+rm -rf "$PGDATA"/*
+mkdir -p "$PGDATA"
+chown -R "$PGUSER":postgres "$PGDATA"
+
+chmod 700 "$PGDATA"
+
+tar -xzf "$BACKUP_DIR/$BACKUP_FILE/base.tar.gz" -C "$PGDATA"
+tar -xzf "$BACKUP_DIR/$BACKUP_FILE/pg_wal.tar.gz" -C "$ARCHIVE_DIR"
+mv -n "$WAL"/* "$ARCHIVE_DIR"
+
+tar -xzf "$BACKUP_DIR/$BACKUP_FILE/16385.tar.gz" -C "$TABLESPACE_DIR"
+
+rm -rf "$PGDATA"/pg_tblspc/*
+rm -f "$PGDATA"/pg_tablespace_map/*
+ln -s "$TABLESPACE_DIR" "$PGDATA"/pg_tblspc/16385
+
+CONF="$PGDATA/postgresql.conf"
+sed -i '' '/^[[:space:]]*#*[[:space:]]*archive_mode/d' "$CONF"
+sed -i '' '/^[[:space:]]*#*[[:space:]]*archive_command/d' "$CONF"
+sed -i '' '/^[[:space:]]*#*[[:space:]]*recovery_target_timeline/d' "$CONF"
+sed -i '' '/^[[:space:]]*#*[[:space:]]*recovery_target_time/d' "$CONF"
+sed -i '' '/^[[:space:]]*#*[[:space:]]*restore_command/d' "$CONF"
+
+
+cat >> "$CONF" <<EOF
+archive_mode = 'off'
+archive_command = ''
+restore_command= 'cp $ARCHIVE_DIR/%f %p'
+recovery_target_time = '$TIME'
+recovery_target_action = 'promote'
+EOF
+
+rm -rf $PGDATA/postgresql.auto.conf
+touch $PGDATA/recovery.signal
+
+chown -R $PGUSER:postgres $PGDATA
+chmod 700 $PGDATA
+pg_ctl start
+  
+  
+```  
+
+Выполнив который получаем восстановление базы до состояния до удаления таблиц
+
+```shell
+[postgres0@pg155 ~]$ ./recovery_wal.sh
+waiting for server to shut down..... done
+server stopped
+waiting for server to start....2025-05-22 22:04:27.037 GMT [59709] LOG:  skipping missing configuration file "/var/db/postgres0/tah70/postgresql.auto.conf"
+2025-05-23 01:04:27.114 MSK [59709] LOG:  redirecting log output to logging collector process
+2025-05-23 01:04:27.114 MSK [59709] HINT:  Future log output will appear in directory "log".
+ done
+server started
+[postgres0@pg155 ~]$ psql -U postgres0 fargoldcity -p 9136
+psql (16.4)
+Type "help" for help.
+
+fargoldcity=# select * from test_table;
+ id |  name
+----+---------
+  1 | Alice
+  2 | Bob
+  3 | Charlie
+  4 | David
+  5 | Eve
+  6 | Frank
+  7 | Grace
+  8 | one
+  9 | two
+ 10 | three
+(10 rows)
+
+fargoldcity=#
+```
+
+<details>
+<summary>Пруфы скринами</summary>
+<img src="images/rec_3.png" alt="Скриншот" />
+</details>  
+
+---
+
+## Вывод
+
+В ходе выполнения лабораторной работы была настроена система резервного копирования и восстановления базы данных. Причем
+несколькими способами. Создание базовых бэкапов для восстановления базы данных из WAL файлов вообще не было очевидным
+пунктом, из-за чего было потрачено очень много нервов и самообладания на то, чтобы не расплакаться. Но теперь я знаю об
+этом и умею восстанавливать базы двумя способами. Таким образом, данная лабораторная работы была полезной.
