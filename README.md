@@ -595,6 +595,7 @@ fargoldcity=#
 
 <details>
 <summary>Пруфы скринами</summary>
+<img src="images/drop.png" alt="Скриншот" />
 <img src="images/rec_3.png" alt="Скриншот" />
 </details>  
 
