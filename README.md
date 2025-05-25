@@ -248,15 +248,7 @@ psql: error: connection to server on socket "/tmp/.s.PGSQL.9136" failed: No such
 [postgres0@pg155 ~]$
 ```
 
-Поэтому получаем с резерва последний бэкап
-
-```shell
-[postgres2@pg158 ~]$ scp backups/fargoldcity_2025-05-25.sql.gz postgres0@pg155.cs.ifmo.ru:~/
-(postgres0@pg155.cs.ifmo.ru) Password for postgres0@pg155.cs.ifmo.ru:
-fargoldcity_2025-05-22.sql.gz                                                             100%  926     1.3MB/s   00:00
-```
-
-И запускаем аналогичный резервному скрипт восстановления базы на основном узле
+Поэтому получаем с резерва последний бэкап и запускаем аналогичный резервному скрипт восстановления базы на основном узле
 ```bash
 #!/usr/local/bin/bash
 
