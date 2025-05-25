@@ -77,66 +77,38 @@
 
 **Предварительно были прокинуты ssh ключи**
 
+**Основной**
+
 ```bash
 #!/usr/local/bin/bash
 
-DATE=$(date +"%Y-%m-%d")
-BACKUP_NAME="fargoldcity_$DATE.sql"
-
-pg_dump -U postgres0 fargoldcity -p 9136 > ~/"$BACKUP_NAME"
-
-gzip ~/"$BACKUP_NAME"
-
-scp ~/"$BACKUP_NAME".gz postgres2@pg158.cs.ifmo.ru:~/backups
-
-rm ~/"$BACKUP_NAME".gz
-```
-
-```shell
-pg_dumpall --globals-only | grep -v -i "TABLESPACE" > ~/backups/globals_roles_only.sql
-```
-
-Запустим скрипт, чтобы проверить его работоспособность
-
-**Основной узел**
-
-```shell
-[postgres0@pg155 ~]$ scripts/backup_script.sh
-/var/db/postgres0/fargoldcity_2025-05-21.sql.gz already exists -- do you wish to overwrite (y or n)? y
-fargoldcity_2025-05-21.sql.gz                                                         100%  926     1.3MB/s   00:00
-[postgres0@pg155 ~]$
+pg_dumpall -U postgres0 -p 9136 | gzip
 ```
 
 **Резервный**
 
-```shell
-[postgres2@pg158 ~/backups]$ ls
-fargoldcity_2025-05-21.sql.gz
-[postgres2@pg158 ~/backups]$ ls -l
-total 5
--rw-r--r--  1 postgres2 postgres 926 21 мая   23:23 fargoldcity_2025-05-21.sql.gz
-[postgres2@pg158 ~/backups]$
+```bash
+#!/usr/local/bin/bash
+
+DATE=$(date +"%Y-%m-%d")
+BACKUP_NAME="cluster_$DATE.sql.gz"
+BACKUP_DIR=~
+REMOTE_USER=postgres0
+REMOTE_HOST=pg155.cs.ifmo.ru
+
+ssh "$REMOTE_USER@$REMOTE_HOST" "bash dump_cluster.sh" > "$BACKUP_DIR/$BACKUP_NAME"
+find "$BACKUP_DIR" -name "cluster_*.sql.gz" -type f -mtime +28 -exec rm -f {} \;
 ```
 
-Теперь настроим ```cron``` на бэкап раз в сутки в 00:00
+Теперь настроим ```cron``` на бэкап раз в сутки в 00:00 (на резервном узле)
 
 ```shell
 crontab -e
 
-0 0 * * * ~/scripts/backup_script.sh >> /var/db/postgres0/backup.log 2>&1
+0 0 * * * ~/get_dump.sh >> /var/db/postgres2/backup.log 2>&1
 
-[postgres0@pg155 ~]$ crontab -l
-0 0 * * * ~/scripts/backup_script.sh >> /var/db/postgres0/backup.log 2>&1
-[postgres0@pg155 ~]$
-```
-
-Автоматическое удаление на резервном узле
-
-```shell
-[postgres2@pg158 ~]$ crontab -e
-0 0 * * * find ~/backups -type f -name "*.gz" -mtime +28 -exec rm {} \;
 [postgres2@pg158 ~]$ crontab -l
-0 0 * * * find ~/backups -type f -name "*.gz" -mtime +28 -exec rm {} \; 
+0 0 * * * ~/get_dump.sh >> /var/db/postgres2/backup.log 2>&1
 [postgres2@pg158 ~]$
 ```
 
@@ -163,80 +135,49 @@ $$
 
 ### Этап 2. Потеря основного узла
 
-```shell
-mkdir tah70
-chmod 700 tah70
-export PGDATA=~/tah70
-initdb --encoding=ISO_8859_5 --username=postgres0 --pwprompt
-mkdir vwp40
-chmod 700 vwp40
-pg_ctl -D $PGDATA start
-```
 
 ```bash
 #!/usr/local/bin/bash
 
-DUMP_FILE=~/backups/fargoldcity_2025-05-21.sql
-TABLESPACE_DIR=~/vwp40
+DUMP_FILE=~/cluster_$DATE.sql
 PGPORT=5432
-PGUSER=postgres0
-DBNAME=fargoldcity
+PGDATA=tah70
+OLD_TABLESPACE_DIR='/var/db/postgres0/vwp40'
+NEW_TABLESPACE_DIR='/var/db/postgres2/new_vwp40'
+DUMP_FILE="cluster_2025-05-25.sql"
 
-mkdir -p "$TABLESPACE_DIR"
-chmod 700 "$TABLESPACE_DIR"
+gzip -d "$DUMP_FILE".gz
 
-psql -U "$PGUSER" -p "$PGPORT" -d postgres -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE 
-    rolname = 'cityuser') THEN CREATE ROLE cityuser LOGIN PASSWORD '1234'; END IF; END \$\$;"
+pg_ctl stop -D "$PGDATA"
+rm -rf "$PGDATA"/*
+rm -rf "$NEW_TABLESPACE_DIR"
 
-psql -U "$PGUSER" -p "$PGPORT" -d postgres -c "SELECT 1 FROM pg_tablespace WHERE spcname = 'index_space';" | grep -q 1
-if [ $? -ne 0 ]; then
-  psql -U "$PGUSER" -p "$PGPORT" -d postgres -c "CREATE TABLESPACE index_space LOCATION '$TABLESPACE_DIR';"
-fi
 
-psql -U "$PGUSER" -p "$PGPORT" -d postgres -c "SELECT 1 FROM pg_database WHERE datname = '$DBNAME';" | grep -q 1
-if [ $? -ne 0 ]; then
-  createdb -U "$PGUSER" -p "$PGPORT" -O "$PGUSER" "$DBNAME"
-fi
+export PGDATA=$PGDATA
 
-psql -U "$PGUSER" -p "$PGPORT" -d "$DBNAME" < "$DUMP_FILE"
+mkdir -p "$PGDATA"
+chmod 700 "$PGDATA"
 
-```
+initdb -D "$PGDATA" --encoding=UTF8 --locale=C
+pg_ctl -D "$PGDATA" -o "-p $PGPORT" -w start
 
-И если мы теперь зайдем в бд и посмотрим табличку, то все на месте
+mkdir -p "$NEW_TABLESPACE_DIR"
+chmod 700 "$NEW_TABLESPACE_DIR"
 
-```shell
-[postgres2@pg158 ~]$ psql -U cityuser -p 5432 -d fargoldcity
-psql (16.4)
-Type "help" for help.
 
-fargoldcity=> \du
-                             List of roles
- Role name |                         Attributes
------------+------------------------------------------------------------
- cityuser  |
- postgres0 | Superuser, Create role, Create DB, Replication, Bypass RLS
- 
-fargoldcity=> select * from test_table
-fargoldcity-> ;
- id |  name
-----+---------
-  1 | Alice
-  2 | Bob
-  3 | Charlie
-  4 | David
-  5 | Eve
-  6 | Frank
-  7 | Grace
-(7 rows)
+OLD="LOCATION '$OLD_TABLESPACE_DIR'"
+NEW="LOCATION '$NEW_TABLESPACE_DIR'"
 
-fargoldcity=>
+sed -i '' "s|$OLD|$NEW|g" cluster_2025-05-25.sql
+
+psql -U postgres2 -p "$PGPORT" -d postgres -f "$DUMP_FILE"
 ```
 
 <details>
-<summary>Пруфы скринами</summary>
-<img src="images/recovery_script.png" alt="Скриншот" />
-
+<summary>Результат</summary>
 <img src="images/rec_1.png" alt="Скриншот" />
+
+<img src="images/rec_4.png" alt="Скриншот" />
 </details>
 
 ---
@@ -310,63 +251,96 @@ psql: error: connection to server on socket "/tmp/.s.PGSQL.9136" failed: No such
 Поэтому получаем с резерва последний бэкап
 
 ```shell
-[postgres2@pg158 ~]$ scp backups/fargoldcity_2025-05-22.sql.gz postgres0@pg155.cs.ifmo.ru:~/
+[postgres2@pg158 ~]$ scp backups/fargoldcity_2025-05-25.sql.gz postgres0@pg155.cs.ifmo.ru:~/
 (postgres0@pg155.cs.ifmo.ru) Password for postgres0@pg155.cs.ifmo.ru:
 fargoldcity_2025-05-22.sql.gz                                                             100%  926     1.3MB/s   00:00
 ```
 
-Удаляем прошлый кластер и пересоздаем новый, так как содержимое кластера становится недостоверным, единственный надёжный
-способ восстановить работу СУБД — полностью переинициализировать кластер с помощью initdb, а затем восстановить данные
-из резервной копии.
-
-```shell
-[postgres0@pg155 ~]$ rm -rf tah70
-[postgres0@pg155 ~]$ mkdir tah70
-[postgres0@pg155 ~]$ chmod 700 tah70
-[postgres0@pg155 ~]$ export PGDATA=~/tah70
-[postgres0@pg155 ~]$ initdb --encoding=ISO_8859_5 --username=postgres0 --pwprompt
-### А тут я меняю порты на 9136 с 5432
-[postgres0@pg155 ~]$ pg_ctl -D $PGDATA start
-````
-
-И запускаем скрипт восстановления
-
+И запускаем аналогичный резервному скрипт восстановления базы на основном узле
 ```bash
 #!/usr/local/bin/bash
 
-PGPORT=9136
-PGUSER=postgres0
-DBNAME=fargoldcity
-DUMP_FILE=~/fargoldcity_2025-05-22.sql
-NEW_TABLESPACE_DIR=~/new_vwp40
-TABLESPACE_NAME=index_space
+DUMP_FILE=~/cluster_$DATE.sql
+PGPORT=5432
+PGDATA=tah70
+OLD_TABLESPACE_DIR='/var/db/postgres0/vwp40'
+NEW_TABLESPACE_DIR='/var/db/postgres0/new_vwp40'
+DUMP_FILE="cluster_2025-05-25.sql"
 
+gzip -d "$DUMP_FILE".gz
+
+pg_ctl stop -D "$PGDATA"
+rm -rf "$PGDATA"/*
+rm -rf "$NEW_TABLESPACE_DIR"
+
+
+export PGDATA=$PGDATA
+
+mkdir -p "$PGDATA"
+chmod 700 "$PGDATA"
+
+initdb -D "$PGDATA" --encoding=UTF8 --locale=C
+pg_ctl -D "$PGDATA" -o "-p $PGPORT" -w start
 
 mkdir -p "$NEW_TABLESPACE_DIR"
 chmod 700 "$NEW_TABLESPACE_DIR"
 
-psql -U "$PGUSER" -p "$PGPORT" -d postgres -tc "SELECT 1 FROM pg_roles WHERE rolname='cityuser'" | grep -q 1 || \
-psql -U "$PGUSER" -p "$PGPORT" -d postgres -c "CREATE ROLE cityuser LOGIN PASSWORD '1234';"
 
-psql -U "$PGUSER" -p "$PGPORT" -d postgres -tc "SELECT 1 FROM pg_tablespace WHERE spcname='$TABLESPACE_NAME'" | grep -q 1 || \
-psql -U "$PGUSER" -p "$PGPORT" -d postgres -c "CREATE TABLESPACE $TABLESPACE_NAME LOCATION '$NEW_TABLESPACE_DIR';"
+OLD="LOCATION '$OLD_TABLESPACE_DIR'"
+NEW="LOCATION '$NEW_TABLESPACE_DIR'"
 
-psql -U "$PGUSER" -p "$PGPORT" -lqt | cut -d \| -f 1 | grep -qw "$DBNAME" || \
-psql -U "$PGUSER" -p "$PGPORT" -d postgres -c "CREATE DATABASE $DBNAME OWNER $PGUSER TEMPLATE template1;"
+sed -i '' "s|$OLD|$NEW|g" cluster_2025-05-25.sql
 
-gzip -d "$DUMP_FILE".gz
+psql -U postgres2 -p "$PGPORT" -d postgres -f "$DUMP_FILE"
 
-psql -U "$PGUSER" -p "$PGPORT" -d "$DBNAME" < "$DUMP_FILE"
-psql -U "$PGUSER" -p "$PGPORT" -d "$DBNAME" -c '\dt'
 ```
 
 **Результат**
 
 ```shell
-[postgres0@pg155 ~]$ ./restore_base.sh
+[postgres0@pg155 ~]$ ./restore_cluster.sh
+gzip: can't stat: cluster_2025-05-25.sql.gz: No such file or directory
+ожидание завершения работы сервера.... готово
+сервер остановлен
+Файлы, относящиеся к этой СУБД, будут принадлежать пользователю "postgres0".
+От его имени также будет запускаться процесс сервера.
+
+Кластер баз данных будет инициализирован с локалью "C".
+Выбрана конфигурация текстового поиска по умолчанию "english".
+
+Контроль целостности страниц данных отключён.
+
+исправление прав для существующего каталога tah70... ок
+создание подкаталогов... ок
+выбирается реализация динамической разделяемой памяти... posix
+выбирается значение max_connections по умолчанию... 100
+выбирается значение shared_buffers по умолчанию... 128MB
+выбирается часовой пояс по умолчанию... Europe/Moscow
+создание конфигурационных файлов... ок
+выполняется подготовительный скрипт... ок
+выполняется заключительная инициализация... ок
+сохранение данных на диске... ок
+
+initdb: предупреждение: включение метода аутентификации "trust" для локальных подключений
+initdb: подсказка: Другой метод можно выбрать, отредактировав pg_hba.conf или ещё раз запустив initdb с ключом -A, --auth-local или --auth-host.
+
+Готово. Теперь вы можете запустить сервер баз данных:
+
+    pg_ctl -D tah70 -l файл_журнала start
+
+ожидание запуска сервера....2025-05-25 21:35:13.581 MSK [66706] LOG:  ending log output to stderr
+2025-05-25 21:35:13.581 MSK [66706] HINT:  Future log output will go to log destination "syslog".
+ готово
+сервер запущен
+SET
+SET
+SET
 CREATE ROLE
+ALTER ROLE
+CREATE ROLE
+ALTER ROLE
 CREATE TABLESPACE
-CREATE DATABASE
+Вы подключены к базе данных "template1" как пользователь "postgres0".
 SET
 SET
 SET
@@ -375,7 +349,38 @@ SET
  set_config
 ------------
 
-(1 row)
+(1 строка)
+
+SET
+SET
+SET
+SET
+SET
+SET
+SET
+SET
+SET
+ set_config
+------------
+
+(1 строка)
+
+SET
+SET
+SET
+SET
+CREATE DATABASE
+ALTER DATABASE
+Вы подключены к базе данных "fargoldcity" как пользователь "postgres0".
+SET
+SET
+SET
+SET
+SET
+ set_config
+------------
+
+(1 строка)
 
 SET
 SET
@@ -390,25 +395,36 @@ CREATE SEQUENCE
 ALTER SEQUENCE
 ALTER SEQUENCE
 ALTER TABLE
-COPY 7
+COPY 10
  setval
 --------
-      7
-(1 row)
+     40
+(1 строка)
 
 ALTER TABLE
 SET
 CREATE INDEX
 GRANT
-           List of relations
- Schema |    Name    | Type  |  Owner
---------+------------+-------+----------
- public | test_table | table | cityuser
-(1 row)
+Вы подключены к базе данных "postgres" как пользователь "postgres0".
+SET
+SET
+SET
+SET
+SET
+ set_config
+------------
+
+(1 строка)
+
+SET
+SET
+SET
+SET
+[postgres0@pg155 ~]$
 ```
 
 <details>
-<summary>Пруфы скринами</summary>
+<summary>Результаты/summary>
 <img src="images/rec_2.png" alt="Скриншот" />
 </details>
 
